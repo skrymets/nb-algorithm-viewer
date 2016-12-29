@@ -6,21 +6,21 @@ import org.netbeans.module.sandbox.utils.IDUtility;
  *
  * @author Lot
  */
-public class BlockFlowElement extends AbstractFlowElement {
+public class StatementElement extends AbstractFlowElement {
 
     private static final long serialVersionUID = -4607983324082601217L;
 
     private String content;
 
-    public BlockFlowElement() {
-        super("block_" + IDUtility.generateID());
+    public StatementElement() {
+        super("statement_" + IDUtility.generateID());
     }
 
     public String getContent() {
         return content;
     }
 
-    public <T extends BlockFlowElement> T setContent(String content) {
+    public <T extends StatementElement> T setContent(String content) {
         this.content = content;
         return (T) this;
     }

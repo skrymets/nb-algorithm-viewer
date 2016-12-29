@@ -1,6 +1,10 @@
 package org.netbeans.module.sandbox.model.graph;
 
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -105,6 +109,18 @@ public class Edge<T, P> implements Serializable {
     }
 
     public void collapse() {
+    }
+
+    public Collection<Edge<T, P>> selfCopy(int copies) {
+        if (copies < 1) {
+            return Collections.emptyList();
+        }
+
+        List<Edge<T, P>> clones = new ArrayList<>(copies);
+        for (int i = 0; i < copies; i++) {
+            clones.add(selfCopy());
+        }
+        return clones;
     }
 
     public Edge<T, P> selfCopy() {

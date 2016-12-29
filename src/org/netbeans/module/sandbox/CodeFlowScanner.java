@@ -18,18 +18,23 @@ import com.sun.source.util.TreePath;
 import com.sun.source.util.TreePathScanner;
 import java.awt.Color;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.netbeans.api.java.source.CompilationInfo;
-import org.netbeans.module.sandbox.model.alg.BlockFlowElement;
+import org.netbeans.module.sandbox.model.alg.StatementElement;
 import org.netbeans.module.sandbox.model.alg.CycleElement;
 import org.netbeans.module.sandbox.model.alg.FlowElement;
 import org.netbeans.module.sandbox.model.alg.ForkElement;
 import org.netbeans.module.sandbox.model.alg.JoinElement;
+import org.netbeans.module.sandbox.model.alg.StartBlockElement;
 import org.netbeans.module.sandbox.model.alg.StartElement;
+import org.netbeans.module.sandbox.model.alg.StopBlockElement;
 import org.netbeans.module.sandbox.model.alg.StopElement;
 import org.netbeans.module.sandbox.model.graph.Edge;
 import org.netbeans.module.sandbox.model.graph.Node;
@@ -53,7 +58,6 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     private final Node<FlowElement> entryPoint;
     private final Node<FlowElement> exitPoint;
     private final Edge<FlowElement, String> initialFlow;
-    private final Node<FlowElement> exceptionPoint;
 
     public final ThreadLocal<AtomicBoolean> stopScan = new ThreadLocal<>();
 
@@ -70,7 +74,7 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
 
         graph = new CodeFlowGraph();
         entryPoint = graph.createNode(new StartElement());
-        exceptionPoint = graph.createNode(new StopElement());
+
         exitPoint = graph.createNode(new StopElement());
         // Use "always-linked-insert-in-the-middle" approach.
         // ( ) --> (*)
@@ -149,25 +153,94 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     }
 
     @Override
-    public Edge visitTry(TryTree node, Edge<FlowElement, String> p) {
+    public Edge<FlowElement, String> visitTry(TryTree node, Edge<FlowElement, String> flow) {
 
-        BlockTree actions = node.getBlock();
-        List<? extends CatchTree> catches = node.getCatches();
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // (X) --[flow]--> (Y)
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        Node<FlowElement> startTryNode = graph.createNode(new StartBlockElement().setContent("try"));
+        Edge.Split<FlowElement, String> tryFlows = flow.insertMiddleNode(startTryNode);
+        Edge<FlowElement, String> tryActionsEdge;
+        tryActionsEdge = tryFlows.getRightEdge().setPayload(null);
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // (X) --[flow]--> (startTryNode) --[tryActionsEdge]--> (Y)
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        Node<FlowElement> endTryNode = graph.createNode(new StopBlockElement().setContent(""));
+        Edge.Split<FlowElement, String> endTryEdges = tryActionsEdge.insertMiddleNode(endTryNode);
+        tryActionsEdge = endTryEdges.getLeftEdge();
+        Edge<FlowElement, String> flowAfterTry = endTryEdges.getRightEdge();
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // (X) --[flow]--> (startTryNode) --[tryActionsEdge]--> (endTryNode) --[flowAfterTry]--> (Y)
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+        Node<FlowElement> catchNode = graph.createNode(new StartBlockElement().setContent("catch"));
+        Edge.Split<FlowElement, String> catchEdges = tryActionsEdge.insertMiddleNode(catchNode);
+        tryActionsEdge = catchEdges.getLeftEdge();
+        Edge<FlowElement, String> catchEdge = catchEdges.getRightEdge();
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        // (X) --[flow]--> (startTryNode) --[tryActionsEdge]--> (catchNode) --[catchEdge]--> (endTryNode) --[flowAfterTry]--> (Y)
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         BlockTree finallyBlock = node.getFinallyBlock();
+        if (finallyBlock != null) {
+            Node<FlowElement> finallyNode = graph.createNode(new StartBlockElement().setContent("finally"));
+            Edge.Split<FlowElement, String> finallyEdges = catchEdge.insertMiddleNode(finallyNode);
+            catchEdge = finallyEdges.getLeftEdge();
+            Edge<FlowElement, String> finallyEdge = finallyEdges.getRightEdge();
+            // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            // ... --> (catchNode) --[catchEdge]--> (finallyNode) --[finallyEdge]--> (endTryNode) --[flowAfterTry]--> (Y)
+            // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            checkIsCancelled();
+            // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            super.scan(finallyBlock, finallyEdge);
+        }
 
-        return super.visitTry(node, p); //To change body of generated methods, choose Tools | Templates.
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        BlockTree actions = node.getBlock();
+        if (actions != null) {
+            checkIsCancelled();
+            super.scan(actions, tryActionsEdge);
+        }
+
+        // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        List<? extends CatchTree> catches = node.getCatches();
+        if (catches == null || catches.isEmpty()) {
+
+        } else {
+            final Edge<FlowElement, String> holder = catchEdge;
+            Iterator<Edge<FlowElement, String>> clones = (catches.size() > 1
+                    ? new ArrayList<Edge<FlowElement, String>>() {
+                private static final long serialVersionUID = 1L;
+
+                {
+                    add(holder);
+                    addAll(holder.selfCopy(catches.size() - 1));
+                }
+            }
+                    : Collections.singletonList(catchEdge)).iterator();
+            for (CatchTree ct : catches) {
+                BlockTree catchBlock = ct.getBlock();
+                if (catchBlock != null) {
+                    checkIsCancelled();
+                    Edge<FlowElement, String> catchEdgeCopy = clones.next();
+                    catchEdgeCopy.setPayload("exception");
+                    super.scan(catchBlock, catchEdgeCopy);
+                }
+            }
+        }
+
+        return flowAfterTry;
     }
 
-    
     @Override
-    public Edge visitThrow(ThrowTree node, Edge<FlowElement, String> flow) {
-        
+    public Edge<FlowElement, String> visitThrow(ThrowTree node, Edge<FlowElement, String> flow) {
+
         //TODO: Show/create exceptionPoint only if there is at least one throw statement
         //TODO: Change shape/color of the throw's exceptionPoint
-
-        Node<FlowElement> throwNode = graph.createNode(new BlockFlowElement().setContent(node.getExpression().toString()));
+        Node<FlowElement> throwNode = graph.createNode(new StatementElement().setContent(node.getExpression().toString()));
         Edge.Split<FlowElement, String> throwFlows = flow.insertMiddleNode(throwNode);
-        graph.breakEdge(throwFlows.getRightEdge());
+        // graph.breakEdge(throwFlows.getRightEdge());
+        Node<FlowElement> exceptionPoint = graph.createNode(new StopElement());
         Edge<FlowElement, String> exceptionFlow = throwNode.connectNodeFromRight(exceptionPoint);
 
         return exceptionFlow;
@@ -182,7 +255,7 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     }
 
     @Override
-    public Edge visitEnhancedForLoop(EnhancedForLoopTree node, Edge<FlowElement, String> flow) {
+    public Edge<FlowElement, String> visitEnhancedForLoop(EnhancedForLoopTree node, Edge<FlowElement, String> flow) {
         checkIsCancelled();
         StatementTree statement = node.getStatement();
         Edge<FlowElement, String> afterCycleFlow = visitCycleUnified(flow, statement);
@@ -190,7 +263,7 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     }
 
     @Override
-    public Edge visitWhileLoop(WhileLoopTree node, Edge<FlowElement, String> flow) {
+    public Edge<FlowElement, String> visitWhileLoop(WhileLoopTree node, Edge<FlowElement, String> flow) {
         checkIsCancelled();
         StatementTree statement = node.getStatement();
         Edge<FlowElement, String> afterCycleFlow = visitCycleUnified(flow, statement);
@@ -198,7 +271,7 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     }
 
     @Override
-    public Edge visitDoWhileLoop(DoWhileLoopTree node, Edge<FlowElement, String> flow) {
+    public Edge<FlowElement, String> visitDoWhileLoop(DoWhileLoopTree node, Edge<FlowElement, String> flow) {
         checkIsCancelled();
         StatementTree statement = node.getStatement();
         Edge<FlowElement, String> afterCycleFlow = visitCycleUnified(flow, statement);
@@ -239,13 +312,13 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         //TODO: MOVE COLLAPSE TO AN OUTER PROCESSOR!!!!
         FlowElement flowElement = flow.getLeft().getPayload();
-        if (flowElement instanceof BlockFlowElement) {
-            BlockFlowElement block = ((BlockFlowElement) flowElement);
+        if (flowElement instanceof StatementElement) {
+            StatementElement block = ((StatementElement) flowElement);
             String newContent = String.valueOf(block.getContent()) + "\n" + callMethodName;
             block.setContent(newContent);
             return flow;
         } else {
-            Node<FlowElement> methodCall = graph.createNode(new BlockFlowElement().setContent(callMethodName));
+            Node<FlowElement> methodCall = graph.createNode(new StatementElement().setContent(callMethodName));
             Edge.Split<FlowElement, String> methodCallEdges = flow.insertMiddleNode(methodCall);
             Edge<FlowElement, String> currentFlow = methodCallEdges.getRightEdge().setPayload(null);
             // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -257,13 +330,13 @@ public class CodeFlowScanner extends TreePathScanner<Edge, Edge<FlowElement, Str
     }
 
     @Override
-    public Edge visitOther(Tree node, Edge<FlowElement, String> flow) {
+    public Edge<FlowElement, String> visitOther(Tree node, Edge<FlowElement, String> flow) {
         checkIsCancelled();
 
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         // BEGIN: (X) --[flow]--> (Y)
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        Node<FlowElement> other = graph.createNode(new BlockFlowElement().setContent(node.toString()));
+        Node<FlowElement> other = graph.createNode(new StatementElement().setContent(node.toString()));
         Edge.Split<FlowElement, String> otherEdges = flow.insertMiddleNode(other);
         Edge<FlowElement, String> currentFlow = otherEdges.getRightEdge().setPayload(null);
         // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
